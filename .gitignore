@@ -1,0 +1,26 @@
+# Secrets and local config
+.env
+*.env
+!.env.example
+
+# Google OAuth local files
+credentials.json
+token.json
+
+# Logs and runtime artifacts
+logs/
+*.log
+*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db

@@ -166,11 +166,11 @@ def make_log_row(
 def load_api_settings() -> tuple[str, str, str, str, int]:
     base_url = (os.getenv("AFFILKA_BASE_URL", "") or "").strip()
     email = os.getenv("AFFILKA_OPERATOR_EMAIL", "")
-    password = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
+    operator_password = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
     totp_secret = os.getenv("AFFILKA_TOTP_SECRET", "")
     rpm = int(os.getenv("AFFILKA_RPM", "60"))
 
-    if not base_url or not email or not password or not totp_secret:
+    if not base_url or not email or not operator_password or not totp_secret:
         raise ValueError("Missing required AFFILKA_* values in .env.")
 
     allowed_hosts = parse_allowed_hosts(
@@ -180,7 +180,7 @@ def load_api_settings() -> tuple[str, str, str, str, int]:
         base_url,
         allowed_hosts=allowed_hosts,
     )
-    return validated_url, email, password, totp_secret, rpm
+    return validated_url, email, operator_password, totp_secret, rpm
 
 
 def main() -> None:
@@ -197,7 +197,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        base_url, email, password, totp_secret, rpm = load_api_settings()
+        base_url, email, operator_password, totp_secret, rpm = load_api_settings()
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -240,7 +240,7 @@ def main() -> None:
         client = PartnerPlatformClient(
             base_url,
             email,
-            password,
+            operator_password,
             totp_secret,
             rpm=rpm,
         )

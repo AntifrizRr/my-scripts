@@ -1,13 +1,14 @@
-name: portfolio-ci
+name: checks
 
 on:
   push:
     branches:
       - main
+      - agent/**
   pull_request:
 
 jobs:
-  python-and-scripts:
+  code-checks:
     runs-on: ubuntu-latest
 
     steps:
@@ -30,22 +31,17 @@ jobs:
           python -m pip install -e "./rename_partners[dev]"
           python -m pip install openpyxl
 
-      - name: Python compile check
-        run: |
-          python -m compileall rename_partners/src tools
+      - name: Compile Python files
+        run: python -m compileall rename_partners/partner_automation tools
 
-      - name: Ruff
-        run: |
-          python -m ruff check rename_partners/src rename_partners/tests tools
+      - name: Run Ruff
+        run: python -m ruff check rename_partners/partner_automation rename_partners/tests tools
 
-      - name: Python tests
-        run: |
-          python -m pytest -q
+      - name: Run Python tests
+        run: python -m pytest -q
 
-      - name: Apps Script helper tests
-        run: |
-          node --test google-apps-script/aff-partners-info/tests/apps_script_helpers.test.js
+      - name: Run Apps Script helper tests
+        run: node --test google-apps-script/aff-partners-info/tests/apps_script_helpers.test.js
 
-      - name: Secret scan
-        run: |
-          python tools/secret_scan.py
+      - name: Scan for committed secrets
+        run: python tools/secret_scan.py

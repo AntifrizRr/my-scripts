@@ -1103,22 +1103,73 @@ function postToSlackWebhook_(webhookUrl, text) {
 }
 
 function parseLocalizedNumber_(value) {
-  if (value === null || value === undefined || value === "") return null;
-  if (typeof value === "number") return value;
-
-  let s = String(value).trim();
-  if (!s) return null;
-
-  s = s.replace(/[\s\u00A0]/g, "");
-
-  if (s.includes(",") && !s.includes(".")) {
-    s = s.replace(",", ".");
-  } else {
-    s = s.replace(/,/g, "");
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
   }
 
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  let text = String(value ?? "").trim();
+  if (!text) return null;
+
+  text = text
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, "")
+    .replace(/[^\d.,+-]/g, "");
+
+  if (!/^[+-]?\d[\d.,]*$/.test(text)) {
+    return null;
+  }
+
+  const commaCount = (text.match(/,/g) || []).length;
+  const dotCount = (text.match(/\./g) || []).length;
+
+  // Два разных разделителя:
+  // последний считается десятичным, предыдущий — разделителем тысяч.
+  if (commaCount > 0 && dotCount > 0) {
+    if (text.lastIndexOf(",") > text.lastIndexOf(".")) {
+      // Например: 1.234,56 -> 1234.56
+      text = text.replace(/\./g, "").replace(/,/g, ".");
+    } else {
+      // Например: 1,234.56 -> 1234.56
+      text = text.replace(/,/g, "");
+    }
+  } else if (commaCount > 0) {
+    if (commaCount === 1) {
+      const [integerPart, fractionalPart] = text.split(",");
+
+      // По требованиям теста 1,234 — это 1234.
+      // В остальных случаях запятая используется как десятичный разделитель.
+      text = fractionalPart.length === 3
+        ? `${integerPart}${fractionalPart}`
+        : `${integerPart}.${fractionalPart}`;
+    } else {
+      const parts = text.split(",");
+      const lastPart = parts.pop();
+
+      const allThousands = parts
+        .slice(1)
+        .concat(lastPart)
+        .every(part => part.length === 3);
+
+      text = allThousands
+        ? `${parts.join("")}${lastPart}`
+        : `${parts.join("")}.${lastPart}`;
+    }
+  } else if (dotCount > 1) {
+    const parts = text.split(".");
+    const lastPart = parts.pop();
+
+    const allThousands = parts
+      .slice(1)
+      .concat(lastPart)
+      .every(part => part.length === 3);
+
+    text = allThousands
+      ? `${parts.join("")}${lastPart}`
+      : `${parts.join("")}.${lastPart}`;
+  }
+
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function parseDateValue_(value) {

@@ -82,7 +82,10 @@ run('rangesIntersect_ finds overlaps', () => {
 });
 
 run('escapeSlackText_ handles markdown and mentions', () => {
-    assert.strictEqual(context.escapeSlackText_('Hello <@synthetic-user> *world*'), 'Hello &lt;@synthetic-user&gt; \*world\*');
+    assert.strictEqual(
+        context.escapeSlackText_('Hello <@synthetic-user> *world*'),
+        'Hello &lt;@synthetic-user&gt; \\*world\\*'
+    );
     assert.strictEqual(context.escapeSlackText_('A&B'), 'A&amp;B');
 });
 

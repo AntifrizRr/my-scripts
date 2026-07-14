@@ -5,7 +5,7 @@ import re
 import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import gspread
 import pandas as pd

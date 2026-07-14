@@ -259,7 +259,7 @@ function buildRuntimeContext_(sourceSheet, headers, headerMap) {
     sourceSheet,
     headers,
     headerMap,
-    channelId: getProp_("SLACK_CHANNEL"),
+    channelId: getRequiredProp_("SLACK_CHANNEL"),
     logCache: loadSlackLogCache_(logSheet),
     activeCache: null,
   };
@@ -2205,7 +2205,7 @@ function withRetries_(fn, opts = {}) {
 }
 
 function fetchSlack_(url, payloadObj) {
-  const token = getProp_("SLACK_BOT_TOKEN");
+  const token = getRequiredProp_("SLACK_BOT_TOKEN");
 
   return withRetries_(() => {
     const resp = UrlFetchApp.fetch(url, {
@@ -2342,7 +2342,7 @@ function slackPostMessage_(payload) {
   return data;
 }
 
-function getProp_(key) {
+function getRequiredProp_(key) {
   const v = PropertiesService.getScriptProperties().getProperty(key);
   if (!v) throw new Error(`Script property не задан: ${key}`);
   return v;
@@ -2377,7 +2377,7 @@ function runMigrationToUniqueKey() {
  ***************/
 function testSlack() {
   const res = slackPostMessage_({
-    channel: getProp_("SLACK_CHANNEL"),
+    channel: getRequiredProp_("SLACK_CHANNEL"),
     text: "✅ testSlack: сообщение из Apps Script"
   });
   Logger.log(res);

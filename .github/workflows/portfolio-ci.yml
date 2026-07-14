@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - codex/portfolio-ready
   pull_request:
 
 jobs:

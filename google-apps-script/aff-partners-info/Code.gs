@@ -1173,36 +1173,63 @@ function parseLocalizedNumber_(value) {
 }
 
 function parseDateValue_(value) {
-  if (value === null || value === undefined || value === "") return null;
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime())
+      ? null
+      : new Date(value.getTime());
+  }
 
   const raw = String(value).trim();
   if (!raw) return null;
 
-  const direct = new Date(raw);
-  if (!Number.isNaN(direct.getTime())) {
-    return direct;
-  }
+  const buildUtcDate = (year, month, day) => {
+    const candidate = new Date(Date.UTC(year, month - 1, day));
 
-  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (isoMatch) {
-    const [_, y, m, d] = isoMatch.map(Number);
-    const candidate = new Date(Date.UTC(y, m - 1, d));
-    if (candidate.getUTCFullYear() === y && candidate.getUTCMonth() === m - 1 && candidate.getUTCDate() === d) {
+    if (
+      candidate.getUTCFullYear() === year &&
+      candidate.getUTCMonth() === month - 1 &&
+      candidate.getUTCDate() === day
+    ) {
       return candidate;
     }
+
     return null;
+  };
+
+  // Строгий формат YYYY-MM-DD.
+  // Проверяется до обычного new Date(), чтобы 2024-02-30
+  // не превратилось автоматически в 2024-03-01.
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+  if (isoMatch) {
+    return buildUtcDate(
+      Number(isoMatch[1]),
+      Number(isoMatch[2]),
+      Number(isoMatch[3])
+    );
   }
 
+  // Строгий формат DD/MM/YYYY.
   const euMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+
   if (euMatch) {
-    const [_, d, m, y] = euMatch.map(Number);
-    const candidate = new Date(Date.UTC(y, m - 1, d));
-    if (candidate.getUTCFullYear() === y && candidate.getUTCMonth() === m - 1 && candidate.getUTCDate() === d) {
-      return candidate;
-    }
+    return buildUtcDate(
+      Number(euMatch[3]),
+      Number(euMatch[2]),
+      Number(euMatch[1])
+    );
   }
 
-  return null;
+  // Другие поддерживаемые JavaScript форматы.
+  const direct = new Date(raw);
+
+  return Number.isNaN(direct.getTime())
+    ? null
+    : direct;
 }
 
 function hasDuplicateUniqueKey_(values) {

@@ -1,71 +1,55 @@
 import os
 import re
 import sys
-from typing import Dict, List
+from typing import Dict, Iterable, List, Tuple
 
 import gspread
 import pandas as pd
 from dotenv import load_dotenv
 
-from .portfolio_shared import (
-    ClientClient,
+from .integration_helpers import (
     GoogleOAuthClient,
+    PartnerPlatformClient,
     norm_str,
+    parse_allowed_hosts,
     parse_partner_ids,
     safe_csv_value,
+    successful_partner_ids,
+    validate_partner_base_url,
     validate_required_columns,
 )
 
-# ============================================================
-# DIRECTORY (same sheet)
-# ============================================================
 COL_PARTNER_ID = "Partner ID"
 COL_NEW_NAME = "Partner Name"
 COL_RENAME = "Rename"
 
-# ============================================================
-# Google OAuth
-# ============================================================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
+
+def normalize_worksheet_title(value: str) -> str:
+    value = (value or "").replace("\u00a0", " ").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value.casefold()
 
 
-def _norm_ws_title(s: str) -> str:
-    # normalize: trim, collapse whitespace (incl. NBSP), casefold
-    s = (s or "").replace("\u00a0", " ").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s.casefold()
-
-
-def open_worksheet_fuzzy(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
-    """
-    Tries to open worksheet by exact title; if not found, tries fuzzy match:
-    - trims
-    - collapses whitespace
-    - case-insensitive
-    Prints available sheet titles on failure.
-    """
-    wanted_raw = title or ""
-    wanted = _norm_ws_title(wanted_raw)
+def open_worksheet_fuzzy(
+    spreadsheet: gspread.Spreadsheet,
+    title: str,
+) -> gspread.Worksheet:
     try:
-        return sh.worksheet(wanted_raw)
-    except Exception:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
         pass
 
-    # Fuzzy match
-    wss = sh.worksheets()
-    for ws in wss:
-        if _norm_ws_title(ws.title) == wanted:
-            print(
-                f"[ws] Fuzzy matched worksheet: requested='{wanted_raw}' -> actual='{ws.title}'"
-            )
-            return ws
+    normalized_title = normalize_worksheet_title(title)
+    worksheets = spreadsheet.worksheets()
 
-    titles = [ws.title for ws in wss]
+    for worksheet in worksheets:
+        if normalize_worksheet_title(worksheet.title) == normalized_title:
+            print(f"[sheet] requested='{title}' matched='{worksheet.title}'")
+            return worksheet
+
+    available = [worksheet.title for worksheet in worksheets]
     raise gspread.exceptions.WorksheetNotFound(
-        f"{wanted_raw!r}. Available tabs: {titles}"
+        f"{title!r}. Available tabs: {available}"
     )
 
 
@@ -78,184 +62,231 @@ def get_gspread_client():
     return client.get_client()
 
 
-def sheet_to_df(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
+def sheet_to_dataframe(worksheet) -> pd.DataFrame:
+    values = worksheet.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
-    header = values[0]
-    rows = values[1:]
-    return pd.DataFrame(rows, columns=header)
+    return pd.DataFrame(values[1:], columns=values[0])
 
 
-def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    return df
+def a1_column(column_index_zero_based: int) -> str:
+    number = column_index_zero_based + 1
+    result = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 
-def ensure_required_columns(df: pd.DataFrame, cols: List[str], sheet_name: str) -> None:
-    validate_required_columns(df, cols, sheet_name)
+def chunks(
+    values: List[Tuple[str, List[str]]],
+    size: int,
+) -> Iterable[List[Tuple[str, List[str]]]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
 
 
-def a1_col(col_idx_0_based: int) -> str:
-    n = col_idx_0_based + 1
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def _chunks(seq, size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
-
-def main():
-    load_dotenv()
-
-    # Plan_Fact target (same sheet/tab in твоём случае)
-    plan_sheet_id = (os.getenv("PLAN_FACT_SHEET_ID", "") or "").strip()
-    plan_tab = (os.getenv("PLAN_FACT_TAB_NAME", "") or "").strip()
-    col_aff_id = (os.getenv("PLAN_FACT_COL_AFF_ID", "Affiliate ID") or "").strip()
-    col_aff_name = (os.getenv("PLAN_FACT_COL_AFF_NAME", "Affiliate") or "").strip()
-
-    # Directory source
-    dir_sheet_id = (os.getenv("DIRECTORY_SHEET_ID", "") or "").strip()
-    dir_tab = (os.getenv("DIRECTORY_TAB_NAME", "") or "").strip()
-
-    if not plan_sheet_id or not plan_tab or not dir_sheet_id or not dir_tab:
-        print("Missing PLAN_FACT_* or DIRECTORY_* in .env", file=sys.stderr)
-        sys.exit(1)
-
-    base_url = os.getenv("AFFILKA_BASE_URL", "").rstrip("/")
-    op_email = os.getenv("AFFILKA_OPERATOR_EMAIL", "")
-    op_pass = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
+def load_api_settings() -> tuple[str, str, str, str, int]:
+    base_url = (os.getenv("AFFILKA_BASE_URL", "") or "").strip()
+    email = os.getenv("AFFILKA_OPERATOR_EMAIL", "")
+    password = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
     totp_secret = os.getenv("AFFILKA_TOTP_SECRET", "")
     rpm = int(os.getenv("AFFILKA_RPM", "60"))
 
-    if not base_url or not op_email or not op_pass or not totp_secret:
-        print("Missing AFFILKA_* vars in .env", file=sys.stderr)
-        sys.exit(1)
+    if not base_url or not email or not password or not totp_secret:
+        raise ValueError("Missing required AFFILKA_* values in .env.")
 
-    gc = get_gspread_client()
+    allowed_hosts = parse_allowed_hosts(
+        os.getenv("AFFILKA_ALLOWED_HOSTS", "")
+    )
+    validated_url = validate_partner_base_url(
+        base_url,
+        allowed_hosts=allowed_hosts,
+    )
+    return validated_url, email, password, totp_secret, rpm
 
-    # Read directory and build mapping ONLY for rows that have Rename mark
-    sh_dir = gc.open_by_key(dir_sheet_id)
-    ws_dir = open_worksheet_fuzzy(sh_dir, dir_tab)
-    df_dir = sheet_to_df(ws_dir)
-    df_dir = ensure_columns(df_dir, [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME])
-    ensure_required_columns(df_dir, [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME], "Directory")
+
+def build_confirmed_name_mapping(
+    dataframe: pd.DataFrame,
+) -> Dict[int, str]:
+    """Build a mapping only from confirmed rename results."""
 
     mapping: Dict[int, str] = {}
-    for _, r in df_dir.iterrows():
-        rm = norm_str(r.get(COL_RENAME, ""))
-        if not rm.startswith("RENAMED"):
-            continue
-        target = norm_str(r.get(COL_NEW_NAME, ""))
-        if not target:
-            continue
-        ids = parse_partner_ids(r.get(COL_PARTNER_ID, ""))
-        for pid in ids:
-            mapping[pid] = target
 
-    if not mapping:
-        print("Nothing to sync: no rows with Rename mark in directory sheet.")
+    for _, row in dataframe.iterrows():
+        target_name = norm_str(row.get(COL_NEW_NAME, ""))
+        if not target_name:
+            continue
+
+        partner_ids = parse_partner_ids(row.get(COL_PARTNER_ID, ""))
+        confirmed_ids = successful_partner_ids(
+            row.get(COL_RENAME, ""),
+            partner_ids,
+        )
+
+        for partner_id in confirmed_ids:
+            mapping[partner_id] = target_name
+
+    return mapping
+
+
+def main() -> None:
+    load_dotenv()
+
+    plan_sheet_id = (os.getenv("PLAN_FACT_SHEET_ID", "") or "").strip()
+    plan_tab = (os.getenv("PLAN_FACT_TAB_NAME", "") or "").strip()
+    directory_sheet_id = (
+        os.getenv("DIRECTORY_SHEET_ID", "") or ""
+    ).strip()
+    directory_tab = (os.getenv("DIRECTORY_TAB_NAME", "") or "").strip()
+    affiliate_id_column = (
+        os.getenv("PLAN_FACT_COL_AFF_ID", "Affiliate ID") or ""
+    ).strip()
+    affiliate_name_column = (
+        os.getenv("PLAN_FACT_COL_AFF_NAME", "Affiliate") or ""
+    ).strip()
+
+    if (
+        not plan_sheet_id
+        or not plan_tab
+        or not directory_sheet_id
+        or not directory_tab
+    ):
+        print(
+            "Missing PLAN_FACT_* or DIRECTORY_* values in .env.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        base_url, email, password, totp_secret, rpm = load_api_settings()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    google_client = get_gspread_client()
+
+    directory_spreadsheet = google_client.open_by_key(directory_sheet_id)
+    directory_worksheet = open_worksheet_fuzzy(
+        directory_spreadsheet,
+        directory_tab,
+    )
+    directory_dataframe = sheet_to_dataframe(directory_worksheet)
+
+    if directory_dataframe.empty:
+        print("Directory sheet is empty.")
         return
 
-    # Affilka
-    client = ClientClient(base_url, op_email, op_pass, totp_secret, rpm=rpm)
-    print("== Affilka login ==")
+    validate_required_columns(
+        directory_dataframe,
+        [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME],
+        directory_tab,
+    )
+
+    mapping = build_confirmed_name_mapping(directory_dataframe)
+    if not mapping:
+        print("Nothing to sync: no confirmed rename results.")
+        return
+
+    client = PartnerPlatformClient(
+        base_url,
+        email,
+        password,
+        totp_secret,
+        rpm=rpm,
+    )
+    print("== Partner platform login ==")
     client.login()
 
-    # Open Plan_Fact (same tab)
-    sh_pf = gc.open_by_key(plan_sheet_id)
-    ws_pf = open_worksheet_fuzzy(sh_pf, plan_tab)
-    df_pf = sheet_to_df(ws_pf)
-    if df_pf.empty:
+    plan_spreadsheet = google_client.open_by_key(plan_sheet_id)
+    plan_worksheet = open_worksheet_fuzzy(plan_spreadsheet, plan_tab)
+    plan_dataframe = sheet_to_dataframe(plan_worksheet)
+
+    if plan_dataframe.empty:
         print("Target sheet is empty.")
         return
 
-    df_pf = ensure_columns(df_pf, [col_aff_id, col_aff_name])
-    ensure_required_columns(df_pf, [col_aff_id, col_aff_name], plan_tab)
+    validate_required_columns(
+        plan_dataframe,
+        [affiliate_id_column, affiliate_name_column],
+        plan_tab,
+    )
 
-    aff_name_idx = list(df_pf.columns).index(col_aff_name)
-    aff_name_letter = a1_col(aff_name_idx)
+    affiliate_name_index = list(plan_dataframe.columns).index(
+        affiliate_name_column
+    )
+    affiliate_name_letter = a1_column(affiliate_name_index)
 
-    already_ok = 0
+    updates: List[Tuple[str, List[str]]] = []
+    checked = 0
+    already_correct = 0
     api_mismatch = 0
     cannot_fetch = 0
     no_mapping = 0
 
-    updates_cells: List[str] = []
-    updates_vals: List[List[str]] = []
+    for index, row in plan_dataframe.iterrows():
+        sheet_row = index + 2
+        partner_ids = parse_partner_ids(row.get(affiliate_id_column, ""))
 
-    checked = 0
-    changed = 0
-
-    for i, row in df_pf.iterrows():
-        sheet_row = i + 2
-
-        raw_aff_id = norm_str(row.get(col_aff_id, ""))
-        if not raw_aff_id:
+        if not partner_ids:
             continue
 
-        ids = parse_partner_ids(raw_aff_id)
-        if not ids:
-            continue
+        partner_id = partner_ids[0]
+        target_name = mapping.get(partner_id)
 
-        pid = ids[0]
-        target_name = mapping.get(pid)
         if not target_name:
             no_mapping += 1
             continue
 
-        # API check: update only if current partner name == target_name
-        api_name = client.get_partner_name(pid)
+        current_api_name = client.get_partner_name(partner_id)
         checked += 1
-        if api_name is None:
+
+        if current_api_name is None:
             cannot_fetch += 1
-            print(f"[skip] row={sheet_row} pid={pid}: cannot fetch current name")
+            print(
+                f"[skip] row={sheet_row} partner_id={partner_id}: "
+                "could not read the API value"
+            )
             continue
 
-        if norm_str(api_name) != target_name:
+        if norm_str(current_api_name) != target_name:
             api_mismatch += 1
             print(
-                f"[skip] row={sheet_row} pid={pid}: current='{api_name}' != target='{target_name}'"
+                f"[skip] row={sheet_row} partner_id={partner_id}: "
+                f"API value '{current_api_name}' does not match "
+                f"confirmed value '{target_name}'"
             )
             continue
 
-        cur_aff = norm_str(row.get(col_aff_name, ""))
-        if cur_aff == target_name:
-            already_ok += 1
-            print(
-                f"[noop] row={sheet_row} pid={pid}: Affiliate already '{target_name}'"
-            )
+        current_sheet_name = norm_str(row.get(affiliate_name_column, ""))
+        if current_sheet_name == target_name:
+            already_correct += 1
             continue
 
-        updates_cells.append(f"{aff_name_letter}{sheet_row}")
-        updates_vals.append([safe_csv_value(target_name)])
-        changed += 1
-        print(
-            f"[update] row={sheet_row} pid={pid} affiliate='{cur_aff}' -> '{target_name}'"
+        updates.append(
+            (
+                f"{affiliate_name_letter}{sheet_row}",
+                [safe_csv_value(target_name)],
+            )
         )
 
-    if updates_cells:
-        # Google API doesn't accept list of A1 cells in ws.update(); use batch_update per-cell (chunked).
-        for batch in _chunks(list(zip(updates_cells, updates_vals)), 500):
-            ws_pf.batch_update(
-                [{"range": rng, "values": [val]} for rng, val in batch],
-                value_input_option="RAW",
-            )
+    for batch in chunks(updates, 500):
+        plan_worksheet.batch_update(
+            [
+                {"range": cell_range, "values": [values]}
+                for cell_range, values in batch
+            ],
+            value_input_option="RAW",
+        )
 
-    print("\nDONE ✅")
-    print(f"- mapping size: {len(mapping)}")
-    print(f"- checked via API: {checked}")
-    print(f"- updated cells: {changed}")
-    print(f"- already_ok: {already_ok}")
-    print(f"- api_mismatch: {api_mismatch}")
-    print(f"- cannot_fetch: {cannot_fetch}")
-    print(f"- no_mapping: {no_mapping}")
+    print("Sync completed.")
+    print(f"- confirmed mapping: {len(mapping)}")
+    print(f"- checked through API: {checked}")
+    print(f"- updated cells: {len(updates)}")
+    print(f"- already correct: {already_correct}")
+    print(f"- API mismatch: {api_mismatch}")
+    print(f"- could not fetch: {cannot_fetch}")
+    print(f"- no confirmed mapping: {no_mapping}")
 
 
 if __name__ == "__main__":

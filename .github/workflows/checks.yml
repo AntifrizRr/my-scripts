@@ -32,10 +32,10 @@ jobs:
           python -m pip install openpyxl
 
       - name: Compile Python files
-        run: python -m compileall rename_partners/src tools
+        run: python -m compileall rename_partners/partner_automation tools
 
       - name: Run Ruff
-        run: python -m ruff check rename_partners/src rename_partners/tests tools
+        run: python -m ruff check rename_partners/partner_automation rename_partners/tests tools
 
       - name: Run Python tests
         run: python -m pytest -q

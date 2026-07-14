@@ -8,68 +8,55 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import gspread
-
 import pandas as pd
 from dotenv import load_dotenv
 
-from .portfolio_shared import (
-    ClientClient,
+from .integration_helpers import (
     GoogleOAuthClient,
+    PartnerPlatformClient,
     build_rename_mark,
     norm_str,
+    parse_allowed_hosts,
     parse_partner_ids,
     parse_rename_mark,
     safe_csv_value,
     should_process_partner_id,
+    validate_partner_base_url,
     validate_required_columns,
 )
 
-# ============================================================
-# Columns in DIRECTORY_TAB
-# ============================================================
 COL_PARTNER_ID = "Partner ID"
 COL_OLD_NAME = "OLD name"
 COL_NEW_NAME = "Partner Name"
 COL_RENAME = "Rename"
 
-# ============================================================
-# Google OAuth
-# ============================================================
 
-def _norm_ws_title(s: str) -> str:
-    # normalize: trim, collapse whitespace (incl. NBSP), casefold
-    s = (s or "").replace("\u00a0", " ").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s.casefold()
+def normalize_worksheet_title(value: str) -> str:
+    value = (value or "").replace("\u00a0", " ").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value.casefold()
 
 
-def open_worksheet_fuzzy(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
-    """
-    Tries to open worksheet by exact title; if not found, tries fuzzy match:
-    - trims
-    - collapses whitespace
-    - case-insensitive
-    Prints available sheet titles on failure.
-    """
-    wanted_raw = title or ""
-    wanted = _norm_ws_title(wanted_raw)
+def open_worksheet_fuzzy(
+    spreadsheet: gspread.Spreadsheet,
+    title: str,
+) -> gspread.Worksheet:
     try:
-        return sh.worksheet(wanted_raw)
-    except Exception:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
         pass
 
-    # Fuzzy match
-    wss = sh.worksheets()
-    for ws in wss:
-        if _norm_ws_title(ws.title) == wanted:
-            print(
-                f"[ws] Fuzzy matched worksheet: requested='{wanted_raw}' -> actual='{ws.title}'"
-            )
-            return ws
+    normalized_title = normalize_worksheet_title(title)
+    worksheets = spreadsheet.worksheets()
 
-    titles = [ws.title for ws in wss]
+    for worksheet in worksheets:
+        if normalize_worksheet_title(worksheet.title) == normalized_title:
+            print(f"[sheet] requested='{title}' matched='{worksheet.title}'")
+            return worksheet
+
+    available = [worksheet.title for worksheet in worksheets]
     raise gspread.exceptions.WorksheetNotFound(
-        f"{wanted_raw!r}. Available tabs: {titles}"
+        f"{title!r}. Available tabs: {available}"
     )
 
 
@@ -82,98 +69,121 @@ def get_gspread_client():
     return client.get_client()
 
 
-def sheet_to_df(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
+def sheet_to_dataframe(worksheet) -> pd.DataFrame:
+    values = worksheet.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
-    header = values[0]
-    rows = values[1:]
-    return pd.DataFrame(rows, columns=header)
+    return pd.DataFrame(values[1:], columns=values[0])
 
 
-def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    return df
+def a1_column(column_index_zero_based: int) -> str:
+    number = column_index_zero_based + 1
+    result = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 
-def ensure_required_columns(df: pd.DataFrame, cols: List[str], sheet_name: str) -> None:
-    validate_required_columns(df, cols, sheet_name)
-
-
-def a1_col(col_idx_0_based: int) -> str:
-    n = col_idx_0_based + 1
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-# ============================================================
-# Logging
-# ============================================================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def make_run_log_path() -> str:
     os.makedirs("logs", exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    return os.path.join("logs", f"rename_partners_{ts}.csv")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return os.path.join("logs", f"rename_partners_{timestamp}.csv")
 
 
-def log_print(writer: csv.DictWriter, row: Dict[str, Any]) -> None:
+def write_log(writer: csv.DictWriter, row: Dict[str, Any]) -> None:
     writer.writerow(row)
     print(
-        f"[{row.get('ts_utc')}] row={row.get('sheet_row')} partner_id={row.get('partner_id')} "
+        f"[{row.get('ts_utc')}] row={row.get('sheet_row')} "
+        f"partner_id={row.get('partner_id')} "
         f"action={row.get('action')} status={row.get('status')} "
-        f"api_old='{row.get('old_api_name')}' target='{row.get('target_name')}' note={row.get('note')}"
+        f"target='{row.get('target_name')}' note={row.get('note')}"
     )
 
 
 def archive_old_logs(days: int) -> None:
     os.makedirs("logs", exist_ok=True)
     cutoff = datetime.now() - timedelta(days=days)
-
     candidates = []
-    for p in glob.glob(os.path.join("logs", "rename_partners_*.csv")):
+
+    for path in glob.glob(os.path.join("logs", "rename_partners_*.csv")):
         try:
-            mtime = datetime.fromtimestamp(os.path.getmtime(p))
-            if mtime < cutoff:
-                candidates.append(p)
-        except Exception:
+            if datetime.fromtimestamp(os.path.getmtime(path)) < cutoff:
+                candidates.append(path)
+        except OSError:
             continue
 
     if not candidates:
         return
 
-    zip_name = os.path.join("logs", f"archive_{datetime.now().strftime('%Y-%m')}.zip")
-    with zipfile.ZipFile(zip_name, "a", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in candidates:
-            arc = os.path.basename(p)
-            if arc not in zf.namelist():
-                zf.write(p, arcname=arc)
+    archive_path = os.path.join(
+        "logs",
+        f"archive_{datetime.now().strftime('%Y-%m')}.zip",
+    )
+    with zipfile.ZipFile(
+        archive_path,
+        "a",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archived_names = set(archive.namelist())
+        for path in candidates:
+            archive_name = os.path.basename(path)
+            if archive_name not in archived_names:
+                archive.write(path, arcname=archive_name)
             try:
-                os.remove(p)
-            except Exception:
+                os.remove(path)
+            except OSError:
                 pass
 
 
-# ============================================================
-# Parsing helpers
-# ============================================================
+def make_log_row(
+    sheet_row: int,
+    partner_id: Any,
+    old_sheet_name: str,
+    target_name: str,
+    old_api_name: str,
+    action: str,
+    status: str,
+    note: str,
+) -> Dict[str, Any]:
+    return {
+        "ts_utc": utc_now().isoformat(),
+        "sheet_row": sheet_row,
+        "partner_id": partner_id,
+        "old_sheet_name": old_sheet_name,
+        "target_name": target_name,
+        "old_api_name": old_api_name,
+        "action": action,
+        "status": status,
+        "note": note,
+    }
 
 
-def parse_processed_statuses(rename_mark: Any) -> Dict[int, str]:
-    parsed = parse_rename_mark(rename_mark)
-    return parsed.get("statuses", {})
+def load_api_settings() -> tuple[str, str, str, str, int]:
+    base_url = (os.getenv("AFFILKA_BASE_URL", "") or "").strip()
+    email = os.getenv("AFFILKA_OPERATOR_EMAIL", "")
+    password = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
+    totp_secret = os.getenv("AFFILKA_TOTP_SECRET", "")
+    rpm = int(os.getenv("AFFILKA_RPM", "60"))
 
-# ============================================================
-# MAIN
-# ============================================================
-def main():
+    if not base_url or not email or not password or not totp_secret:
+        raise ValueError("Missing required AFFILKA_* values in .env.")
+
+    allowed_hosts = parse_allowed_hosts(
+        os.getenv("AFFILKA_ALLOWED_HOSTS", "")
+    )
+    validated_url = validate_partner_base_url(
+        base_url,
+        allowed_hosts=allowed_hosts,
+    )
+    return validated_url, email, password, totp_secret, rpm
+
+
+def main() -> None:
     load_dotenv()
 
     sheet_id = (os.getenv("DIRECTORY_SHEET_ID", "") or "").strip()
@@ -181,237 +191,220 @@ def main():
 
     if not sheet_id or not tab_name:
         print(
-            "Missing DIRECTORY_SHEET_ID / DIRECTORY_TAB_NAME in .env", file=sys.stderr
+            "Missing DIRECTORY_SHEET_ID or DIRECTORY_TAB_NAME in .env.",
+            file=sys.stderr,
         )
         sys.exit(1)
-
-    base_url = os.getenv("AFFILKA_BASE_URL", "").rstrip("/")
-    op_email = os.getenv("AFFILKA_OPERATOR_EMAIL", "")
-    op_pass = os.getenv("AFFILKA_OPERATOR_PASSWORD", "")
-    totp_secret = os.getenv("AFFILKA_TOTP_SECRET", "")
-    rpm = int(os.getenv("AFFILKA_RPM", "60"))
-
-    if not base_url or not op_email or not op_pass or not totp_secret:
-        print("Missing AFFILKA_* vars in .env", file=sys.stderr)
-        sys.exit(1)
-
-    archive_old_logs(days=int(os.getenv("LOG_ARCHIVE_AFTER_DAYS", "30")))
-
-    log_path = make_run_log_path()
-    f = open(log_path, "w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(
-        f,
-        fieldnames=[
-            "ts_utc",
-            "sheet_row",
-            "partner_id",
-            "old_sheet_name",
-            "target_name",
-            "old_api_name",
-            "action",
-            "status",
-            "note",
-        ],
-    )
-    writer.writeheader()
 
     try:
-        gc = get_gspread_client()
-        sh = gc.open_by_key(sheet_id)
-        ws = open_worksheet_fuzzy(sh, tab_name)
+        base_url, email, password, totp_secret, rpm = load_api_settings()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
 
-        df = sheet_to_df(ws)
-        if df.empty:
-            print("Sheet is empty (no data rows).")
+    archive_old_logs(
+        days=int(os.getenv("LOG_ARCHIVE_AFTER_DAYS", "30"))
+    )
+    log_path = make_run_log_path()
+    fieldnames = [
+        "ts_utc",
+        "sheet_row",
+        "partner_id",
+        "old_sheet_name",
+        "target_name",
+        "old_api_name",
+        "action",
+        "status",
+        "note",
+    ]
+
+    with open(log_path, "w", newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        google_client = get_gspread_client()
+        spreadsheet = google_client.open_by_key(sheet_id)
+        worksheet = open_worksheet_fuzzy(spreadsheet, tab_name)
+        dataframe = sheet_to_dataframe(worksheet)
+
+        if dataframe.empty:
+            print("Sheet is empty or contains no data rows.")
             return
 
-        df = ensure_columns(
-            df, [COL_PARTNER_ID, COL_OLD_NAME, COL_NEW_NAME, COL_RENAME]
+        validate_required_columns(
+            dataframe,
+            [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME],
+            tab_name,
         )
 
-        client = ClientClient(base_url, op_email, op_pass, totp_secret, rpm=rpm)
-        print("== Affilka login ==")
+        client = PartnerPlatformClient(
+            base_url,
+            email,
+            password,
+            totp_secret,
+            rpm=rpm,
+        )
+        print("== Partner platform login ==")
         client.login()
 
-        rename_col_idx = list(df.columns).index(COL_RENAME)
-        rename_col_letter = a1_col(rename_col_idx)
+        rename_column_index = list(dataframe.columns).index(COL_RENAME)
+        rename_column_letter = a1_column(rename_column_index)
+        updates = []
 
-        updates_cells: List[str] = []
-        updates_vals: List[List[str]] = []
-
-        for i, row in df.iterrows():
-            sheet_row = i + 2
-
-            raw_ids = row.get(COL_PARTNER_ID, "")
+        for index, row in dataframe.iterrows():
+            sheet_row = index + 2
+            raw_partner_ids = row.get(COL_PARTNER_ID, "")
             old_name = norm_str(row.get(COL_OLD_NAME, ""))
             target_name = norm_str(row.get(COL_NEW_NAME, ""))
             rename_mark = norm_str(row.get(COL_RENAME, ""))
-            existing_statuses = parse_processed_statuses(rename_mark)
+
+            parsed_mark = parse_rename_mark(rename_mark)
+            previous_target_name = parsed_mark.get("target_name", "")
+            statuses = dict(parsed_mark.get("statuses", {}))
 
             if not target_name:
-                log_print(
+                write_log(
                     writer,
-                    {
-                        "ts_utc": utc_now().isoformat(),
-                        "sheet_row": sheet_row,
-                        "partner_id": "",
-                        "old_sheet_name": old_name,
-                        "target_name": "",
-                        "old_api_name": "",
-                        "action": "SKIP",
-                        "status": "OK",
-                        "note": "Partner Name is empty",
-                    },
+                    make_log_row(
+                        sheet_row,
+                        "",
+                        old_name,
+                        "",
+                        "",
+                        "SKIP",
+                        "OK",
+                        "Partner Name is empty.",
+                    ),
                 )
                 continue
 
-            partner_ids = parse_partner_ids(raw_ids)
+            partner_ids = parse_partner_ids(raw_partner_ids)
             if not partner_ids:
-                log_print(
+                write_log(
                     writer,
-                    {
-                        "ts_utc": utc_now().isoformat(),
-                        "sheet_row": sheet_row,
-                        "partner_id": "",
-                        "old_sheet_name": old_name,
-                        "target_name": target_name,
-                        "old_api_name": "",
-                        "action": "SKIP",
-                        "status": "OK",
-                        "note": "Partner ID is empty/invalid",
-                    },
+                    make_log_row(
+                        sheet_row,
+                        "",
+                        old_name,
+                        target_name,
+                        "",
+                        "SKIP",
+                        "OK",
+                        "Partner ID is empty or invalid.",
+                    ),
                 )
                 continue
-
-            previous_target_name = ""
-            if existing_statuses:
-                previous_target_name = parse_rename_mark(rename_mark).get("target_name", "")
 
             pending_ids = [
-                pid
-                for pid in partner_ids
-                if should_process_partner_id(existing_statuses.get(pid), target_name, previous_target_name)
+                partner_id
+                for partner_id in partner_ids
+                if should_process_partner_id(
+                    statuses.get(partner_id),
+                    target_name,
+                    previous_target_name,
+                )
             ]
+
             if not pending_ids:
                 continue
 
-            for pid in pending_ids:
-                api_old = client.get_partner_name(pid)
-                if api_old is None:
-                    log_print(
+            for partner_id in pending_ids:
+                current_name = client.get_partner_name(partner_id)
+
+                if current_name is None:
+                    statuses[partner_id] = "cannot_fetch"
+                    write_log(
                         writer,
-                        {
-                            "ts_utc": utc_now().isoformat(),
-                            "sheet_row": sheet_row,
-                            "partner_id": pid,
-                            "old_sheet_name": old_name,
-                            "target_name": target_name,
-                            "old_api_name": "",
-                            "action": "CHECK",
-                            "status": "ERR",
-                            "note": "Cannot fetch current name via API",
-                        },
+                        make_log_row(
+                            sheet_row,
+                            partner_id,
+                            old_name,
+                            target_name,
+                            "",
+                            "CHECK",
+                            "ERR",
+                            "Could not read the current name from the API.",
+                        ),
                     )
-                    existing_statuses[pid] = "cannot_fetch"
                     continue
 
-                if norm_str(api_old) == target_name:
-                    log_print(
+                if norm_str(current_name) == target_name:
+                    statuses[partner_id] = "noop"
+                    write_log(
                         writer,
-                        {
-                            "ts_utc": utc_now().isoformat(),
-                            "sheet_row": sheet_row,
-                            "partner_id": pid,
-                            "old_sheet_name": old_name,
-                            "target_name": target_name,
-                            "old_api_name": api_old,
-                            "action": "NOOP",
-                            "status": "OK",
-                            "note": "Already has target name",
-                        },
+                        make_log_row(
+                            sheet_row,
+                            partner_id,
+                            old_name,
+                            target_name,
+                            current_name,
+                            "NOOP",
+                            "OK",
+                            "The API already contains the target name.",
+                        ),
                     )
-                    existing_statuses[pid] = "noop"
                     continue
 
                 try:
-                    client.rename_partner(pid, target_name)
-                    api_now = client.get_partner_name(pid) or ""
-                    ok = norm_str(api_now) == target_name
+                    client.rename_partner(partner_id, target_name)
+                    verified_name = client.get_partner_name(partner_id) or ""
 
-                    if ok:
-                        log_print(
-                            writer,
-                            {
-                                "ts_utc": utc_now().isoformat(),
-                                "sheet_row": sheet_row,
-                                "partner_id": pid,
-                                "old_sheet_name": old_name,
-                                "target_name": target_name,
-                                "old_api_name": api_old,
-                                "action": "RENAME",
-                                "status": "OK",
-                                "note": "Renamed",
-                            },
-                        )
-                        existing_statuses[pid] = "renamed"
+                    if norm_str(verified_name) == target_name:
+                        statuses[partner_id] = "renamed"
+                        result_status = "OK"
+                        note = "Name updated and verified."
                     else:
-                        log_print(
-                            writer,
-                            {
-                                "ts_utc": utc_now().isoformat(),
-                                "sheet_row": sheet_row,
-                                "partner_id": pid,
-                                "old_sheet_name": old_name,
-                                "target_name": target_name,
-                                "old_api_name": api_old,
-                                "action": "RENAME",
-                                "status": "WARN",
-                                "note": f"Verify failed (now='{api_now}')",
-                            },
+                        statuses[partner_id] = "verify_failed"
+                        result_status = "WARN"
+                        note = (
+                            "Update request completed, but verification "
+                            f"returned '{verified_name}'."
                         )
-                        existing_statuses[pid] = "verify_failed"
-                except Exception as e:
-                    log_print(
+
+                    write_log(
                         writer,
-                        {
-                            "ts_utc": utc_now().isoformat(),
-                            "sheet_row": sheet_row,
-                            "partner_id": pid,
-                            "old_sheet_name": old_name,
-                            "target_name": target_name,
-                            "old_api_name": api_old,
-                            "action": "RENAME",
-                            "status": "ERR",
-                            "note": str(e)[:800],
-                        },
+                        make_log_row(
+                            sheet_row,
+                            partner_id,
+                            old_name,
+                            target_name,
+                            current_name,
+                            "RENAME",
+                            result_status,
+                            note,
+                        ),
                     )
-                    existing_statuses[pid] = "error"
+                except Exception as exc:
+                    statuses[partner_id] = "error"
+                    write_log(
+                        writer,
+                        make_log_row(
+                            sheet_row,
+                            partner_id,
+                            old_name,
+                            target_name,
+                            current_name,
+                            "RENAME",
+                            "ERR",
+                            str(exc)[:800],
+                        ),
+                    )
 
-            mark = build_rename_mark(target_name, existing_statuses)
-            safe_mark = safe_csv_value(mark)
-
-            updates_cells.append(f"{rename_col_letter}{sheet_row}")
-            updates_vals.append([safe_mark])
-
-        if updates_cells:
-            ws.batch_update(
-                [
-                    {"range": rng, "values": [val]}
-                    for rng, val in zip(updates_cells, updates_vals)
-                ],
-                value_input_option="RAW",
+            mark = safe_csv_value(build_rename_mark(target_name, statuses))
+            updates.append(
+                {
+                    "range": f"{rename_column_letter}{sheet_row}",
+                    "values": [[mark]],
+                }
             )
-            print(f"\nDONE ✅ Updated Rename marks: {len(updates_cells)} row(s)")
+
+        if updates:
+            worksheet.batch_update(updates, value_input_option="RAW")
+            print(f"Updated Rename marks: {len(updates)} row(s).")
         else:
-            print("\nDONE ✅ Nothing to update")
+            print("Nothing to update.")
 
         print(f"Log: {log_path}")
-
-    finally:
-        try:
-            f.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

@@ -2,47 +2,51 @@ name: portfolio-ci
 
 on:
   push:
-    branches: [main, codex/portfolio-ready]
+    branches:
+      - main
+      - codex/portfolio-ready
   pull_request:
 
 jobs:
   python-and-scripts:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ./rename_partners[dev]
+          python -m pip install -e "./rename_partners[dev]"
           python -m pip install openpyxl
+
       - name: Python compile check
         run: |
-          python -m compileall rename_partners/src
+          python -m compileall rename_partners/src tools
+
       - name: Ruff
         run: |
-          ruff check rename_partners/src rename_partners/tests
-      - name: Pytest
+          python -m ruff check rename_partners/src rename_partners/tests tools
+
+      - name: Python tests
         run: |
-          pytest -q rename_partners/tests/test_portfolio_automation.py
-      - name: JS/Apps Script smoke test
+          python -m pytest -q
+
+      - name: Apps Script helper tests
         run: |
-          node --version || true
-          python - <<'PY'
-import pathlib
-import re
-code = pathlib.Path('google-apps-script/aff-partners-info/Code.gs').read_text(encoding='utf-8')
-assert 'function normalizeHeader_' in code
-assert 'function parseLocalizedNumber_' in code
-assert 'function parseDateValue_' in code
-assert 'function hasDuplicateUniqueKey_' in code
-assert 'function rangesIntersect_' in code
-assert 'function escapeSlackText_' in code
-assert 'function normalizeEntityKey_' in code
-print('Apps Script helper presence check passed')
-PY
+          node --test google-apps-script/aff-partners-info/tests/apps_script_helpers.test.js
+
       - name: Secret scan
         run: |
           python tools/secret_scan.py

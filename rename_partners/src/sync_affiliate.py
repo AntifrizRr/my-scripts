@@ -1,26 +1,19 @@
 import os
 import re
 import sys
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests
-import pandas as pd
-import pyotp
-from dotenv import load_dotenv
+from typing import Dict, List
 
 import gspread
-from google.oauth2.credentials import Credentials as UserCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request as GoogleAuthRequest
+import pandas as pd
+from dotenv import load_dotenv
 
-from requests.exceptions import (
-    ReadTimeout,
-    ConnectTimeout,
-    SSLError,
-    ConnectionError,
-    RequestException,
+from .portfolio_shared import (
+    ClientClient,
+    GoogleOAuthClient,
+    norm_str,
+    parse_partner_ids,
+    safe_csv_value,
+    validate_required_columns,
 )
 
 # ============================================================
@@ -76,31 +69,16 @@ def open_worksheet_fuzzy(sh: gspread.Spreadsheet, title: str) -> gspread.Workshe
     )
 
 
-def get_gspread_client() -> gspread.Client:
-    mode = (os.getenv("GOOGLE_AUTH_MODE", "oauth") or "oauth").strip().lower()
-    if mode != "oauth":
-        raise RuntimeError("Expected GOOGLE_AUTH_MODE=oauth.")
-
-    creds_path = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "credentials.json")
-    token_path = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
-
-    creds: Optional[UserCredentials] = None
-    if os.path.exists(token_path):
-        creds = UserCredentials.from_authorized_user_file(token_path, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(GoogleAuthRequest())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-
-    return gspread.authorize(creds)
+def get_gspread_client():
+    client = GoogleOAuthClient(
+        auth_mode=os.getenv("GOOGLE_AUTH_MODE", "oauth"),
+        creds_path=os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "credentials.json"),
+        token_path=os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json"),
+    )
+    return client.get_client()
 
 
-def sheet_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
+def sheet_to_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
@@ -116,6 +94,10 @@ def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     return df
 
 
+def ensure_required_columns(df: pd.DataFrame, cols: List[str], sheet_name: str) -> None:
+    validate_required_columns(df, cols, sheet_name)
+
+
 def a1_col(col_idx_0_based: int) -> str:
     n = col_idx_0_based + 1
     s = ""
@@ -123,207 +105,6 @@ def a1_col(col_idx_0_based: int) -> str:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
-
-
-def norm_str(v: Any) -> str:
-    return "" if v is None else str(v).strip()
-
-
-ID_TOKEN_RE = re.compile(r"\d+")
-
-
-def parse_partner_ids(raw: Any) -> List[int]:
-    if raw is None:
-        return []
-    s = str(raw).strip()
-    if not s:
-        return []
-    nums = ID_TOKEN_RE.findall(s)
-    out: List[int] = []
-    for n in nums:
-        try:
-            out.append(int(n))
-        except Exception:
-            pass
-    seen = set()
-    res = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            res.append(x)
-    return res
-
-
-# ============================================================
-# Affilka client
-# ============================================================
-ParamsType = List[Tuple[str, Any]]
-
-
-class ClientClient:
-    def __init__(
-        self, base_url: str, email: str, password: str, totp_secret: str, rpm: int = 60
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.email = email
-        self.password = password
-        self.totp_secret = totp_secret
-        self.session = requests.Session()
-        self.session.headers.update(
-            {"Accept": "application/json", "Content-Type": "application/json"}
-        )
-        self.min_interval = 60.0 / max(1, rpm)
-        self._last = 0.0
-
-    def _rate(self):
-        now = time.time()
-        dt = now - self._last
-        if dt < self.min_interval:
-            time.sleep(self.min_interval - dt)
-        self._last = time.time()
-
-    def _totp_now(self) -> str:
-        return pyotp.TOTP(self.totp_secret).now()
-
-    def login(self) -> None:
-        url = f"{self.base_url}/api/client/casino/sign_in"
-        last_err = None
-        for _ in range(2):
-            payload = {
-                "casino_user": {
-                    "email": self.email,
-                    "password": self.password,
-                    "otp_attempt": str(self._totp_now()),
-                }
-            }
-            r = self.session.post(url, json=payload, timeout=(20, 180))
-            if r.status_code == 201:
-                last_err = None
-                break
-            last_err = RuntimeError(
-                f"LOGIN expected 201, got {r.status_code}\n{r.text[:2000]}"
-            )
-            time.sleep(1.0)
-        if last_err:
-            raise last_err
-
-        me_url = f"{self.base_url}/api/client/casino/current_user"
-        me = self.session.get(me_url, timeout=(20, 180))
-        if me.status_code != 200:
-            raise RuntimeError(
-                f"current_user expected 200, got {me.status_code}\n{me.text[:2000]}"
-            )
-
-        csrf = (
-            self.session.cookies.get("CSRF-TOKEN")
-            or self.session.cookies.get("XSRF-TOKEN")
-            or self.session.cookies.get("csrf_token")
-        )
-        if not csrf:
-            raise RuntimeError("CSRF cookie not found after current_user.")
-        self.session.headers["X-CSRF-Token"] = csrf
-        self.session.headers["X-CSRF-TOKEN"] = csrf
-
-    def request_json(
-        self,
-        method: str,
-        path: str,
-        params: Optional[ParamsType] = None,
-        json_body: Any = None,
-    ) -> Dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        max_attempts = 10
-        backoff = 3.0
-        timeout = (25, 240)
-
-        for attempt in range(1, max_attempts + 1):
-            self._rate()
-            try:
-                r = self.session.request(
-                    method, url, params=params, json=json_body, timeout=timeout
-                )
-            except (
-                ReadTimeout,
-                ConnectTimeout,
-                SSLError,
-                ConnectionError,
-                RequestException,
-            ) as e:
-                print(
-                    f"[client net] {type(e).__name__}: retry {backoff:.1f}s ({attempt}/{max_attempts})"
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if r.status_code == 429:
-                ra = r.headers.get("Retry-After")
-                wait_s = (
-                    float(ra) if ra and ra.replace(".", "", 1).isdigit() else backoff
-                )
-                print(f"[client 429] wait {wait_s:.1f}s ({attempt}/{max_attempts})")
-                time.sleep(min(wait_s, 180))
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if 500 <= r.status_code <= 599:
-                print(
-                    f"[client {r.status_code}] wait {backoff:.1f}s ({attempt}/{max_attempts})"
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if r.status_code == 204:
-                return {}
-
-            if r.status_code < 200 or r.status_code >= 300:
-                raise RuntimeError(f"HTTP {r.status_code} for {url}\n{r.text[:2000]}")
-
-            if not r.text.strip():
-                return {}
-            return r.json()
-
-        raise RuntimeError(f"Client failed too many retries for {url}")
-
-    def get_partner_name(self, partner_id: int) -> Optional[str]:
-        try:
-            data = self.request_json("GET", f"/api/client/casino/partners/{partner_id}")
-            if isinstance(data, dict):
-                if "partner" in data and isinstance(data["partner"], dict):
-                    return data["partner"].get("name")
-                if "name" in data:
-                    return data.get("name")
-        except Exception:
-            pass
-
-        page = 1
-        for _ in range(1, 400):
-            try:
-                data = self.request_json(
-                    "GET", "/api/client/casino/partners", params=[("page", page)]
-                )
-            except Exception:
-                return None
-
-            items = data.get("items") if isinstance(data, dict) else None
-            if not items:
-                return None
-
-            for it in items:
-                try:
-                    if int(it.get("id")) == int(partner_id):
-                        return it.get("name")
-                except Exception:
-                    continue
-
-            total_pages = int(data.get("total_pages") or page)
-            if page >= total_pages:
-                return None
-            page += 1
-
-        return None
-
 
 
 def _chunks(seq, size: int):
@@ -364,6 +145,7 @@ def main():
     ws_dir = open_worksheet_fuzzy(sh_dir, dir_tab)
     df_dir = sheet_to_df(ws_dir)
     df_dir = ensure_columns(df_dir, [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME])
+    ensure_required_columns(df_dir, [COL_PARTNER_ID, COL_NEW_NAME, COL_RENAME], "Directory")
 
     mapping: Dict[int, str] = {}
     for _, r in df_dir.iterrows():
@@ -395,6 +177,7 @@ def main():
         return
 
     df_pf = ensure_columns(df_pf, [col_aff_id, col_aff_name])
+    ensure_required_columns(df_pf, [col_aff_id, col_aff_name], plan_tab)
 
     aff_name_idx = list(df_pf.columns).index(col_aff_name)
     aff_name_letter = a1_col(aff_name_idx)
@@ -436,6 +219,7 @@ def main():
             continue
 
         if norm_str(api_name) != target_name:
+            api_mismatch += 1
             print(
                 f"[skip] row={sheet_row} pid={pid}: current='{api_name}' != target='{target_name}'"
             )
@@ -450,7 +234,7 @@ def main():
             continue
 
         updates_cells.append(f"{aff_name_letter}{sheet_row}")
-        updates_vals.append([target_name])
+        updates_vals.append([safe_csv_value(target_name)])
         changed += 1
         print(
             f"[update] row={sheet_row} pid={pid} affiliate='{cur_aff}' -> '{target_name}'"

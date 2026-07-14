@@ -1,0 +1,8 @@
+SAMPLE_PASSWORD_VALUE = 'password = "synthetic-secret-value"\n'
+SAMPLE_PASSWORD_TYPE = 'password: str\n'
+SAMPLE_PASSWORD_FORWARD = 'password = password\n'
+SAMPLE_PATTERN = 'pattern = re.compile(r"password")\n'
+SAMPLE_SLACK_ID = 'message = "<@U000000>"\n'
+SAMPLE_PLACEHOLDER = 'message = "<@synthetic-user>"\n'
+SAMPLE_REGEX_CHECK = 'password = "synthetic-secret"'
+SAMPLE_EMBEDDED_CHECK = 'password = password'

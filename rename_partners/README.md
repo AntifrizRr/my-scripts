@@ -1,27 +1,40 @@
 # rename_partners
 
-Скрипты для:
-- переименования партнёров через API
-- синхронизации колонки Affiliate в Google Sheets после переименования
+Portfolio-safe tooling for partner-name automation and operational spreadsheet synchronization.
 
-## Файлы
-- `rename_partners.py` — основной скрипт переименования
-- `sync_affiliate_column_with_api_check.py` — синхронизация Affiliate после успешного rename
-- `.env` — локальные настройки, не хранится в Git
-- `.env.example` — шаблон настроек
-- `credentials.json` — Google OAuth client, не хранится в Git
-- `token.json` — Google OAuth token, не хранится в Git
+## What it does
+- renames partners through a partner platform API
+- verifies the resulting name before marking the operation as successful
+- retries transient failures without skipping the partner ID permanently
+- keeps reporting spreadsheets synchronized after a rename is confirmed
+- protects spreadsheet output from formula-like values
 
-## Как подготовить
-1. Скопировать `.env.example` в `.env`
-2. Заполнить переменные окружения
-3. Положить рядом `credentials.json`
-4. Первый запуск создаст или обновит `token.json`
+## Files
+- src/main.py — rename workflow entry point
+- src/sync_affiliate.py — follow-up sync for affiliate names
+- src/portfolio_shared.py — shared API, OAuth, parsing, validation, and safety helpers
+- .env.example — documented configuration template
+- tests/ — regression tests for parsing, retries, validation, and CSV safety
 
-## Установка зависимостей
+## Installation
 ```bash
-pip install -r requirements.txt
+python -m pip install -e .[dev]
+```
 
-## Запуск
-python rename_partners.py
-python sync_affiliate_column_with_api_check.py
+## Running
+```bash
+python -m src.main
+python -m src.sync_affiliate
+```
+
+## Configuration
+- Required values are documented in .env.example.
+- AFFILKA_BASE_URL must use https and may be restricted via AFFILKA_ALLOWED_HOSTS.
+- Google OAuth credentials should be stored locally and never committed.
+
+## Testing
+```bash
+pytest -q tests/test_portfolio_automation.py
+ruff check src tests
+python -m compileall src
+```

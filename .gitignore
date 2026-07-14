@@ -7,14 +7,21 @@
 credentials.json
 token.json
 
+# Unrelated local helper artifacts
+sinck_manager_partners/
+
 # Logs and runtime artifacts
 logs/
 *.log
 *.csv
+*.xlsx
+*.xlsm
+!google-apps-script/aff-partners-info/anonymized_table.xlsx
 
 # Python cache
 __pycache__/
 *.py[cod]
+*.egg-info/
 
 # Virtual environments
 .venv/

@@ -6,8 +6,33 @@ const TARGET_ACTIVE_SHEET_NAME = "Monthly Partner's active campaigns";
 const SLACKLOG_SHEET_NAME = "SlackLog";
 const MONTHLY_ALERTLOG_SHEET_NAME = "MonthlyAlertLog";
 
-const PF_SPREADSHEET_ID = "1AnG6Yq_OEEMSbVnyiuJm7JLQtOZa6bS1JWr3JjEC5Ug";
-const PF_SHEET_NAME = "SEO Обзорники";
+function getProp_(key, fallback) {
+  const rawValue = PropertiesService.getScriptProperties().getProperty(key);
+  if (rawValue === null || rawValue === "") return fallback;
+  return rawValue;
+}
+
+function parseAffManagerStatusTags_(rawValue) {
+  try {
+    const parsed = JSON.parse(rawValue || "{}") || {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    const result = {};
+    Object.entries(parsed).forEach(([key, value]) => {
+      result[String(key).trim().toLowerCase()] = String(value);
+    });
+    return result;
+  } catch (err) {
+    Logger.log(`Failed to parse AFF_MANAGER_STATUS_TAGS_JSON: ${err}`);
+    return {};
+  }
+}
+
+const PF_SPREADSHEET_ID = getProp_("PF_SPREADSHEET_ID", "REPLACE_WITH_SPREADSHEET_ID");
+const PF_SHEET_NAME = getProp_("PF_SHEET_NAME", "SEO Обзорники");
+const PF_PLATFORM_NAME = getProp_("PF_PLATFORM_NAME", "partner-platform");
 
 // ===== unique_key для Monthly -> SEO Обзорники =====
 const MONTHLY_UNIQUE_KEY_HEADER_NAMES = ["unique_key", "Unique key", "Unique Key"];
@@ -60,7 +85,7 @@ const COL_MONTHLY_TYPE_NAMES = ["FF/Setup fee"];
 const COL_MONTHLY_AMOUNT_NAMES = ["Сумма FF/setup fee"];
 const COL_MONTHLY_PAYMENT_TERM_NAMES = ["Срок оплаты FF/Setup fee"];
 
-const MONTHLY_ALERT_WEBHOOK_URL = "вставить веб хук";
+const MONTHLY_ALERT_WEBHOOK_URL = getProp_("MONTHLY_ALERT_WEBHOOK_URL", "https://example.invalid/webhook");
 const MONTHLY_TRIGGER_TYPES = new Set(["ff", "setup fee"]);
 
 // Значения статусов
@@ -84,17 +109,13 @@ const DEAL_TYPES_PING_ANALYST = new Set([
   "Текущая сделка с UP условий",
 ]);
 
-// Теги (через Slack USER ID)
-const TAG_ON_APPROVAL = "<@U0AFENG4JF4>";
-const TAG_OTHER_STATUSES_DEFAULT = "<@U07AZ2A7ZQF>";
-const TAG_ANALYST = "<@U05JHLW1N3X>";
+// Теги (через Slack USER ID или безопасные placeholder-значения)
+const TAG_ON_APPROVAL = getProp_("SLACK_ON_APPROVAL_MENTION", "<@example>");
+const TAG_OTHER_STATUSES_DEFAULT = getProp_("SLACK_DEFAULT_STATUS_MENTION", "<@ops>");
+const TAG_ANALYST = getProp_("SLACK_ANALYST_MENTION", "<@analyst>");
 
 // Маппинг Aff manager -> кто получает пинг по смене статуса
-const AFF_MANAGER_STATUS_TAGS = {
-  "саша": "<@U07AZ2A7ZQF>",
-  "оля": "<@U0AFENG4JF4>",
-  "коля": "<@U0AQYMVFC6R>",
-};
+const AFF_MANAGER_STATUS_TAGS = parseAffManagerStatusTags_(getProp_("AFF_MANAGER_STATUS_TAGS_JSON", '{"ops":"<@ops>"}'));
 
 // Реакции по статусам
 const STATUS_REACTIONS = {
@@ -330,6 +351,7 @@ function ensureActiveCache_(ctx) {
 function normalizeHeader_(value) {
   return String(value || "")
     .trim()
+    .replace(/[\t\r\n]+/g, " ")
     .replace(/\s+/g, " ")
     .toLowerCase();
 }
@@ -713,97 +735,107 @@ function processPartnerBaseAffiliateManagerSync_(e, sourceSheet) {
 }
 
 function syncAffiliateManagersFromPartnerBaseToPlanFact_() {
-  const sourceSs = SpreadsheetApp.getActive();
-  const sourceSheet = sourceSs.getSheetByName(AFF_PARTNER_BASE_SHEET_NAME);
-  if (!sourceSheet) {
-    throw new Error(`Не найден лист: ${AFF_PARTNER_BASE_SHEET_NAME}`);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("Skipping affiliate manager sync because a script lock could not be acquired.");
+    return;
   }
 
-  const pfSs = SpreadsheetApp.openById(PF_SPREADSHEET_ID);
-  const pfSheet = pfSs.getSheetByName(PF_AFFILKA_DIRECTORY_SHEET_NAME);
-  if (!pfSheet) {
-    throw new Error(`Не найден лист п/ф: ${PF_AFFILKA_DIRECTORY_SHEET_NAME}`);
-  }
-
-  const changeLogSheet = ensureAffiliateChangeLogSheet_(pfSs);
-
-  const sourceLastCol = sourceSheet.getLastColumn();
-  const sourceLastRow = sourceSheet.getLastRow();
-  if (sourceLastCol < 1 || sourceLastRow < 2) return;
-
-  const sourceHeaders = sourceSheet.getRange(1, 1, 1, sourceLastCol).getValues()[0];
-  const sourceHeaderMap = buildHeaderMap_(sourceHeaders);
-
-  const sourcePartnerIdCol = findHeaderIndexByVariants_(sourceHeaderMap, AFF_BASE_COL_PARTNER_ID_NAMES, true);
-  const sourceAffManagerCol = findHeaderIndexByVariants_(sourceHeaderMap, AFF_BASE_COL_AFF_MANAGER_NAMES, true);
-
-  const sourceData = sourceSheet.getRange(2, 1, sourceLastRow - 1, sourceLastCol).getValues();
-
-  const partnerIdToAffManager = {};
-  for (let i = 0; i < sourceData.length; i++) {
-    const row = sourceData[i];
-    const ids = splitPartnerIds_(row[sourcePartnerIdCol - 1]);
-    const manager = normalizeSimpleString_(row[sourceAffManagerCol - 1]);
-
-    if (!ids.length) continue;
-
-    for (const id of ids) {
-      partnerIdToAffManager[id] = manager;
+  try {
+    const sourceSs = SpreadsheetApp.getActive();
+    const sourceSheet = sourceSs.getSheetByName(AFF_PARTNER_BASE_SHEET_NAME);
+    if (!sourceSheet) {
+      throw new Error(`Не найден лист: ${AFF_PARTNER_BASE_SHEET_NAME}`);
     }
-  }
 
-  const pfLastCol = pfSheet.getLastColumn();
-  const pfLastRow = pfSheet.getLastRow();
-  if (pfLastCol < 1 || pfLastRow < 2) return;
+    const pfSs = SpreadsheetApp.openById(PF_SPREADSHEET_ID);
+    const pfSheet = pfSs.getSheetByName(PF_AFFILKA_DIRECTORY_SHEET_NAME);
+    if (!pfSheet) {
+      throw new Error(`Не найден лист п/ф: ${PF_AFFILKA_DIRECTORY_SHEET_NAME}`);
+    }
 
-  const pfHeaders = pfSheet.getRange(1, 1, 1, pfLastCol).getValues()[0];
-  const pfHeaderMap = buildHeaderMap_(pfHeaders);
+    const changeLogSheet = ensureAffiliateChangeLogSheet_(pfSs);
 
-  const pfAffiliateIdCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_AFFILIATE_ID_NAMES, true);
-  const pfAffiliateManagerCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_AFFILIATE_MANAGER_NAMES, true);
-  const pfCampaignIdCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_CAMPAIGN_ID_NAMES, true);
+    const sourceLastCol = sourceSheet.getLastColumn();
+    const sourceLastRow = sourceSheet.getLastRow();
+    if (sourceLastCol < 1 || sourceLastRow < 2) return;
 
-  const pfData = pfSheet.getRange(2, 1, pfLastRow - 1, pfLastCol).getValues();
+    const sourceHeaders = sourceSheet.getRange(1, 1, 1, sourceLastCol).getValues()[0];
+    const sourceHeaderMap = buildHeaderMap_(sourceHeaders);
 
-  const managerWriteRows = [];
-  const logRows = [];
-  const now = new Date();
-  const todayStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd.MM.yyyy");
+    const sourcePartnerIdCol = findHeaderIndexByVariants_(sourceHeaderMap, AFF_BASE_COL_PARTNER_ID_NAMES, true);
+    const sourceAffManagerCol = findHeaderIndexByVariants_(sourceHeaderMap, AFF_BASE_COL_AFF_MANAGER_NAMES, true);
 
-  for (let i = 0; i < pfData.length; i++) {
-    const row = pfData[i];
-    const sheetRow = i + 2;
+    const sourceData = sourceSheet.getRange(2, 1, sourceLastRow - 1, sourceLastCol).getValues();
 
-    const affiliateId = normalizeIdValue_(row[pfAffiliateIdCol - 1]);
-    if (!affiliateId) continue;
+    const partnerIdToAffManager = {};
+    for (let i = 0; i < sourceData.length; i++) {
+      const row = sourceData[i];
+      const ids = splitPartnerIds_(row[sourcePartnerIdCol - 1]);
+      const manager = normalizeSimpleString_(row[sourceAffManagerCol - 1]);
 
-    if (!Object.prototype.hasOwnProperty.call(partnerIdToAffManager, affiliateId)) continue;
+      if (!ids.length) continue;
 
-    const newManager = normalizeSimpleString_(partnerIdToAffManager[affiliateId]);
-    const oldManager = normalizeSimpleString_(row[pfAffiliateManagerCol - 1]);
+      for (const id of ids) {
+        partnerIdToAffManager[id] = manager;
+      }
+    }
 
-    if (newManager === oldManager) continue;
+    const pfLastCol = pfSheet.getLastColumn();
+    const pfLastRow = pfSheet.getLastRow();
+    if (pfLastCol < 1 || pfLastRow < 2) return;
 
-    managerWriteRows.push({
-      row: sheetRow,
-      value: newManager
-    });
+    const pfHeaders = pfSheet.getRange(1, 1, 1, pfLastCol).getValues()[0];
+    const pfHeaderMap = buildHeaderMap_(pfHeaders);
 
-    logRows.push([
-      todayStr,
-      row[pfCampaignIdCol - 1] || "",
-      newManager,
-      oldManager
-    ]);
-  }
+    const pfAffiliateIdCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_AFFILIATE_ID_NAMES, true);
+    const pfAffiliateManagerCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_AFFILIATE_MANAGER_NAMES, true);
+    const pfCampaignIdCol = findHeaderIndexByVariants_(pfHeaderMap, PF_AFFILKA_COL_CAMPAIGN_ID_NAMES, true);
 
-  for (const item of managerWriteRows) {
-    pfSheet.getRange(item.row, pfAffiliateManagerCol).setValue(item.value);
-  }
+    const pfData = pfSheet.getRange(2, 1, pfLastRow - 1, pfLastCol).getValues();
 
-  if (logRows.length) {
-    const startRow = findNextAffiliateChangeLogRow_(changeLogSheet);
-    changeLogSheet.getRange(startRow, 1, logRows.length, AFFILIATE_CHANGELOG_HEADERS.length).setValues(logRows);
+    const managerWriteRows = [];
+    const logRows = [];
+    const now = new Date();
+    const todayStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd.MM.yyyy");
+
+    for (let i = 0; i < pfData.length; i++) {
+      const row = pfData[i];
+      const sheetRow = i + 2;
+
+      const affiliateId = normalizeIdValue_(row[pfAffiliateIdCol - 1]);
+      if (!affiliateId) continue;
+
+      if (!Object.prototype.hasOwnProperty.call(partnerIdToAffManager, affiliateId)) continue;
+
+      const newManager = normalizeSimpleString_(partnerIdToAffManager[affiliateId]);
+      const oldManager = normalizeSimpleString_(row[pfAffiliateManagerCol - 1]);
+
+      if (newManager === oldManager) continue;
+
+      managerWriteRows.push({
+        row: sheetRow,
+        value: newManager
+      });
+
+      logRows.push([
+        todayStr,
+        row[pfCampaignIdCol - 1] || "",
+        newManager,
+        oldManager
+      ]);
+    }
+
+    for (const item of managerWriteRows) {
+      pfSheet.getRange(item.row, pfAffiliateManagerCol).setValue(item.value);
+    }
+
+    if (logRows.length) {
+      const startRow = findNextAffiliateChangeLogRow_(changeLogSheet);
+      changeLogSheet.getRange(startRow, 1, logRows.length, AFFILIATE_CHANGELOG_HEADERS.length).setValues(logRows);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -1089,6 +1121,71 @@ function parseLocalizedNumber_(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function parseDateValue_(value) {
+  if (value === null || value === undefined || value === "") return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const direct = new Date(raw);
+  if (!Number.isNaN(direct.getTime())) {
+    return direct;
+  }
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const [_, y, m, d] = isoMatch.map(Number);
+    const candidate = new Date(Date.UTC(y, m - 1, d));
+    if (candidate.getUTCFullYear() === y && candidate.getUTCMonth() === m - 1 && candidate.getUTCDate() === d) {
+      return candidate;
+    }
+    return null;
+  }
+
+  const euMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (euMatch) {
+    const [_, d, m, y] = euMatch.map(Number);
+    const candidate = new Date(Date.UTC(y, m - 1, d));
+    if (candidate.getUTCFullYear() === y && candidate.getUTCMonth() === m - 1 && candidate.getUTCDate() === d) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function hasDuplicateUniqueKey_(values) {
+  const seen = new Set();
+  for (const value of values || []) {
+    const normalized = String(value || "").trim();
+    if (!normalized) continue;
+    if (seen.has(normalized)) return true;
+    seen.add(normalized);
+  }
+  return false;
+}
+
+function rangesIntersect_(a, b) {
+  const [startA, endA] = a;
+  const [startB, endB] = b;
+  return startA <= endB && startB <= endA;
+}
+
+function escapeSlackText_(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\*/g, "\\*")
+    .replace(/_/g, "\\_");
+}
+
+function normalizeEntityKey_(value) {
+  return normalizeHeader_(value)
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 /*****************************************
  * СИНК: Monthly Partner's active campaigns -> п/ф SEO Обзорники
  * Новая логика:
@@ -1257,7 +1354,7 @@ function writePfPayloadToSheetRow_(pfSheet, pfHeaderMap, rowNumber, payload) {
   const writes = [
     { headerVariants: PF_UNIQUE_KEY_HEADER_NAMES, value: payload.uniqueKey },
     { headerVariants: [PF_HEADERS.sourceId], value: payload.campaignId },
-    { headerVariants: [PF_HEADERS.platform], value: "Glitchspin" },
+    { headerVariants: [PF_HEADERS.platform], value: PF_PLATFORM_NAME },
     { headerVariants: [PF_HEADERS.feeEuro], value: payload.feeAmount },
     { headerVariants: [PF_HEADERS.type], value: payload.feeType },
     { headerVariants: [PF_HEADERS.status], value: payload.mappedStatus },

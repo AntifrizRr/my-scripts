@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.integration_helpers import (
+from partner_automation.integration_helpers import (
     build_rename_mark,
     is_success_status,
     parse_allowed_hosts,
@@ -13,7 +13,7 @@ from src.integration_helpers import (
     validate_partner_base_url,
     validate_required_columns,
 )
-from src.sync_affiliate import build_confirmed_name_mapping
+from partner_automation.sync_affiliate import build_confirmed_name_mapping
 
 
 def test_parse_partner_ids_extracts_unique_numbers():

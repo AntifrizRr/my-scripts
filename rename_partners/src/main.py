@@ -1,29 +1,27 @@
+import csv
+import glob
 import os
 import re
 import sys
-import csv
-import time
-import glob
 import zipfile
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests
-import pandas as pd
-import pyotp
-from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
 
 import gspread
-from google.oauth2.credentials import Credentials as UserCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from requests.exceptions import (
-    ReadTimeout,
-    ConnectTimeout,
-    SSLError,
-    ConnectionError,
-    RequestException,
+import pandas as pd
+from dotenv import load_dotenv
+
+from .portfolio_shared import (
+    ClientClient,
+    GoogleOAuthClient,
+    build_rename_mark,
+    norm_str,
+    parse_partner_ids,
+    parse_rename_mark,
+    safe_csv_value,
+    should_process_partner_id,
+    validate_required_columns,
 )
 
 # ============================================================
@@ -37,11 +35,6 @@ COL_RENAME = "Rename"
 # ============================================================
 # Google OAuth
 # ============================================================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
-
 
 def _norm_ws_title(s: str) -> str:
     # normalize: trim, collapse whitespace (incl. NBSP), casefold
@@ -80,31 +73,16 @@ def open_worksheet_fuzzy(sh: gspread.Spreadsheet, title: str) -> gspread.Workshe
     )
 
 
-def get_gspread_client() -> gspread.Client:
-    mode = (os.getenv("GOOGLE_AUTH_MODE", "oauth") or "oauth").strip().lower()
-    if mode != "oauth":
-        raise RuntimeError("Expected GOOGLE_AUTH_MODE=oauth.")
-
-    creds_path = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "credentials.json")
-    token_path = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
-
-    creds: Optional[UserCredentials] = None
-    if os.path.exists(token_path):
-        creds = UserCredentials.from_authorized_user_file(token_path, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(GoogleAuthRequest())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-
-    return gspread.authorize(creds)
+def get_gspread_client():
+    client = GoogleOAuthClient(
+        auth_mode=os.getenv("GOOGLE_AUTH_MODE", "oauth"),
+        creds_path=os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "credentials.json"),
+        token_path=os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json"),
+    )
+    return client.get_client()
 
 
-def sheet_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
+def sheet_to_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
@@ -118,6 +96,10 @@ def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
     return df
+
+
+def ensure_required_columns(df: pd.DataFrame, cols: List[str], sheet_name: str) -> None:
+    validate_required_columns(df, cols, sheet_name)
 
 
 def a1_col(col_idx_0_based: int) -> str:
@@ -180,250 +162,13 @@ def archive_old_logs(days: int) -> None:
 
 
 # ============================================================
-# Affilka client (operator login + CSRF)
-# ============================================================
-ParamsType = List[Tuple[str, Any]]
-
-
-class ClientClient:
-    def __init__(
-        self, base_url: str, email: str, password: str, totp_secret: str, rpm: int = 60
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.email = email
-        self.password = password
-        self.totp_secret = totp_secret
-        self.session = requests.Session()
-        self.session.headers.update(
-            {"Accept": "application/json", "Content-Type": "application/json"}
-        )
-        self.min_interval = 60.0 / max(1, rpm)
-        self._last = 0.0
-
-    def _rate(self):
-        now = time.time()
-        dt = now - self._last
-        if dt < self.min_interval:
-            time.sleep(self.min_interval - dt)
-        self._last = time.time()
-
-    def _totp_now(self) -> str:
-        return pyotp.TOTP(self.totp_secret).now()
-
-    def login(self) -> None:
-        url = f"{self.base_url}/api/client/casino/sign_in"
-        last_err = None
-        for _ in range(2):
-            payload = {
-                "casino_user": {
-                    "email": self.email,
-                    "password": self.password,
-                    "otp_attempt": str(self._totp_now()),
-                }
-            }
-            r = self.session.post(url, json=payload, timeout=(20, 180))
-            if r.status_code == 201:
-                last_err = None
-                break
-            last_err = RuntimeError(
-                f"LOGIN expected 201, got {r.status_code}\n{r.text[:2000]}"
-            )
-            time.sleep(1.0)
-        if last_err:
-            raise last_err
-
-        me_url = f"{self.base_url}/api/client/casino/current_user"
-        me = self.session.get(me_url, timeout=(20, 180))
-        if me.status_code != 200:
-            raise RuntimeError(
-                f"current_user expected 200, got {me.status_code}\n{me.text[:2000]}"
-            )
-
-        csrf = (
-            self.session.cookies.get("CSRF-TOKEN")
-            or self.session.cookies.get("XSRF-TOKEN")
-            or self.session.cookies.get("csrf_token")
-        )
-        if not csrf:
-            raise RuntimeError("CSRF cookie not found after current_user.")
-        self.session.headers["X-CSRF-Token"] = csrf
-        self.session.headers["X-CSRF-TOKEN"] = csrf
-
-    def request_json(
-        self,
-        method: str,
-        path: str,
-        params: Optional[ParamsType] = None,
-        json_body: Any = None,
-    ) -> Dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        max_attempts = 10
-        backoff = 3.0
-        timeout = (25, 240)
-
-        for attempt in range(1, max_attempts + 1):
-            self._rate()
-            try:
-                r = self.session.request(
-                    method, url, params=params, json=json_body, timeout=timeout
-                )
-            except (
-                ReadTimeout,
-                ConnectTimeout,
-                SSLError,
-                ConnectionError,
-                RequestException,
-            ) as e:
-                print(
-                    f"[client net] {type(e).__name__}: retry {backoff:.1f}s ({attempt}/{max_attempts})"
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if r.status_code == 429:
-                ra = r.headers.get("Retry-After")
-                wait_s = (
-                    float(ra) if ra and ra.replace(".", "", 1).isdigit() else backoff
-                )
-                print(f"[client 429] wait {wait_s:.1f}s ({attempt}/{max_attempts})")
-                time.sleep(min(wait_s, 180))
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if 500 <= r.status_code <= 599:
-                print(
-                    f"[client {r.status_code}] wait {backoff:.1f}s ({attempt}/{max_attempts})"
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 1.7, 180)
-                continue
-
-            if r.status_code == 204:
-                return {}
-
-            if r.status_code < 200 or r.status_code >= 300:
-                raise RuntimeError(f"HTTP {r.status_code} for {url}\n{r.text[:2000]}")
-
-            if not r.text.strip():
-                return {}
-            return r.json()
-
-        raise RuntimeError(f"Client failed too many retries for {url}")
-
-    def get_partner_name(self, partner_id: int) -> Optional[str]:
-        # try direct
-        try:
-            data = self.request_json("GET", f"/api/client/casino/partners/{partner_id}")
-            if isinstance(data, dict):
-                if "partner" in data and isinstance(data["partner"], dict):
-                    return data["partner"].get("name")
-                if "name" in data:
-                    return data.get("name")
-        except Exception:
-            pass
-
-        # fallback list
-        page = 1
-        for _ in range(1, 400):
-            try:
-                data = self.request_json(
-                    "GET", "/api/client/casino/partners", params=[("page", page)]
-                )
-            except Exception:
-                return None
-
-            items = data.get("items") if isinstance(data, dict) else None
-            if not items:
-                return None
-
-            for it in items:
-                try:
-                    if int(it.get("id")) == int(partner_id):
-                        return it.get("name")
-                except Exception:
-                    continue
-
-            total_pages = int(data.get("total_pages") or page)
-            if page >= total_pages:
-                return None
-            page += 1
-
-        return None
-
-    def rename_partner(self, partner_id: int, new_name: str) -> None:
-        self.request_json(
-            "PUT",
-            f"/api/client/casino/partners/{partner_id}",
-            json_body={"partner": {"name": new_name}},
-        )
-
-
-# ============================================================
 # Parsing helpers
 # ============================================================
-ID_TOKEN_RE = re.compile(r"\d+")
 
-
-def parse_partner_ids(raw: Any) -> List[int]:
-    if raw is None:
-        return []
-    s = str(raw).strip()
-    if not s:
-        return []
-    nums = ID_TOKEN_RE.findall(s)
-    out: List[int] = []
-    for n in nums:
-        try:
-            out.append(int(n))
-        except Exception:
-            pass
-    seen = set()
-    res = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            res.append(x)
-    return res
-
-
-def norm_str(v: Any) -> str:
-    return "" if v is None else str(v).strip()
-
-
-
-STATUS_TOKEN_RE = re.compile(r"(\d+):(noop|renamed|error|cannot_fetch)")
 
 def parse_processed_statuses(rename_mark: Any) -> Dict[int, str]:
-    """
-    Parse existing Rename cell text like:
-      RENAMED ... | 123:renamed,456:noop,789:error
-    Returns {123: "renamed", 456: "noop", 789: "error"}.
-    """
-    s = norm_str(rename_mark)
-    out: Dict[int, str] = {}
-    if not s:
-        return out
-    for m in STATUS_TOKEN_RE.finditer(s):
-        try:
-            out[int(m.group(1))] = m.group(2)
-        except Exception:
-            continue
-    return out
-
-def build_rename_mark(target_name: str, statuses: Dict[int, str]) -> str:
-    """
-    Rebuild Rename mark from per-ID statuses.
-    Success statuses: renamed, noop
-    Error statuses: error, cannot_fetch
-    """
-    if not statuses:
-        return ""
-    order = sorted(statuses.keys())
-    notes = ",".join(f"{pid}:{statuses[pid]}" for pid in order)
-    has_error = any(v in {"error", "cannot_fetch"} for v in statuses.values())
-    prefix = "ERROR" if has_error else "RENAMED"
-    return f"{prefix} {utc_now().isoformat()} | target='{target_name}' | " + notes
+    parsed = parse_rename_mark(rename_mark)
+    return parsed.get("statuses", {})
 
 # ============================================================
 # MAIN
@@ -538,13 +283,17 @@ def main():
                 )
                 continue
 
-            # Process only IDs that are not already present in Rename status.
-            # This fixes the case when new IDs are later added into the same cell.
-            pending_ids = [pid for pid in partner_ids if pid not in existing_statuses]
+            previous_target_name = ""
+            if existing_statuses:
+                previous_target_name = parse_rename_mark(rename_mark).get("target_name", "")
+
+            pending_ids = [
+                pid
+                for pid in partner_ids
+                if should_process_partner_id(existing_statuses.get(pid), target_name, previous_target_name)
+            ]
             if not pending_ids:
                 continue
-
-            any_success = any(v in {"renamed", "noop"} for v in existing_statuses.values())
 
             for pid in pending_ids:
                 api_old = client.get_partner_name(pid)
@@ -581,7 +330,6 @@ def main():
                             "note": "Already has target name",
                         },
                     )
-                    any_success = True
                     existing_statuses[pid] = "noop"
                     continue
 
@@ -590,26 +338,38 @@ def main():
                     api_now = client.get_partner_name(pid) or ""
                     ok = norm_str(api_now) == target_name
 
-                    log_print(
-                        writer,
-                        {
-                            "ts_utc": utc_now().isoformat(),
-                            "sheet_row": sheet_row,
-                            "partner_id": pid,
-                            "old_sheet_name": old_name,
-                            "target_name": target_name,
-                            "old_api_name": api_old,
-                            "action": "RENAME",
-                            "status": "OK" if ok else "WARN",
-                            "note": (
-                                "Renamed"
-                                if ok
-                                else f"Renamed but verify failed (now='{api_now}')"
-                            ),
-                        },
-                    )
-                    any_success = True
-                    existing_statuses[pid] = "renamed"
+                    if ok:
+                        log_print(
+                            writer,
+                            {
+                                "ts_utc": utc_now().isoformat(),
+                                "sheet_row": sheet_row,
+                                "partner_id": pid,
+                                "old_sheet_name": old_name,
+                                "target_name": target_name,
+                                "old_api_name": api_old,
+                                "action": "RENAME",
+                                "status": "OK",
+                                "note": "Renamed",
+                            },
+                        )
+                        existing_statuses[pid] = "renamed"
+                    else:
+                        log_print(
+                            writer,
+                            {
+                                "ts_utc": utc_now().isoformat(),
+                                "sheet_row": sheet_row,
+                                "partner_id": pid,
+                                "old_sheet_name": old_name,
+                                "target_name": target_name,
+                                "old_api_name": api_old,
+                                "action": "RENAME",
+                                "status": "WARN",
+                                "note": f"Verify failed (now='{api_now}')",
+                            },
+                        )
+                        existing_statuses[pid] = "verify_failed"
                 except Exception as e:
                     log_print(
                         writer,
@@ -628,9 +388,10 @@ def main():
                     existing_statuses[pid] = "error"
 
             mark = build_rename_mark(target_name, existing_statuses)
+            safe_mark = safe_csv_value(mark)
 
             updates_cells.append(f"{rename_col_letter}{sheet_row}")
-            updates_vals.append([mark])
+            updates_vals.append([safe_mark])
 
         if updates_cells:
             ws.batch_update(

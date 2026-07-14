@@ -31,16 +31,16 @@ Credentials and production identifiers must not be committed.
 ## Running
 
 ```bash
-python -m src.main
-python -m src.sync_affiliate
+python -m partner_automation.main
+python -m partner_automation.sync_affiliate
 ```
 
 ## Checks
 
 ```bash
 python -m pytest -q
-python -m ruff check src tests
-python -m compileall src
+python -m ruff check partner_automation tests
+python -m compileall partner_automation
 ```
 
 The tests cover helper functions and status-processing rules. External API and Google Sheets integrations require local access and are not tested end to end.

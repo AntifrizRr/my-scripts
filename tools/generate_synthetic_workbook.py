@@ -1,48 +1,64 @@
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.comments import Comment
 
-root = Path(__file__).resolve().parents[1]
-out_path = root / 'google-apps-script' / 'aff-partners-info' / 'anonymized_table.xlsx'
 
-wb = Workbook()
-ws = wb.active
-ws.title = 'Synthetic Summary'
-ws['A1'] = 'unique_key'
-ws['B1'] = 'partner_name'
-ws['C1'] = 'campaign_id'
-ws['D1'] = 'status'
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_PATH = (
+    ROOT
+    / "google-apps-script"
+    / "aff-partners-info"
+    / "anonymized_table.xlsx"
+)
 
-for row in [
-    ['alpha-001', 'Example Partner', 'CMP-100', 'Approved'],
-    ['alpha-002', 'Sample Partner', 'CMP-101', 'Pending'],
-]:
-    ws.append(row)
 
-ws['A2'] = 'alpha-001'
-ws['B2'] = 'Example Partner'
-ws['C2'] = 'CMP-100'
-ws['D2'] = 'Approved'
-ws['A3'] = 'alpha-002'
-ws['B3'] = 'Sample Partner'
-ws['C3'] = 'CMP-101'
-ws['D3'] = 'Pending'
+def create_synthetic_workbook() -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Synthetic Summary"
 
-ws.cell(row=2, column=5, value='note').comment = Comment('Synthetic data only', 'Automation Bot')
-ws.freeze_panes = 'A2'
-ws.print_title_rows = '1:1'
+    worksheet.append(
+        [
+            "unique_key",
+            "partner_name",
+            "campaign_id",
+            "status",
+        ]
+    )
 
-ws2 = wb.create_sheet('Hidden Sheet')
-ws2['A1'] = 'hidden'
-ws2.sheet_state = 'hidden'
+    worksheet.append(
+        [
+            "alpha-001",
+            "Example Partner",
+            "CMP-100",
+            "Approved",
+        ]
+    )
 
-wb.create_named_range('synthetic_range', ws, 'A1:D3')
-wb.properties.creator = 'Automation Bot'
-wb.properties.lastModifiedBy = 'Automation Bot'
-wb.properties.title = 'Synthetic Portfolio Workbook'
-wb.properties.subject = 'Portfolio Example'
-wb.properties.description = 'Synthetic workbook for portfolio demonstration'
+    worksheet.append(
+        [
+            "alpha-002",
+            "Sample Partner",
+            "CMP-101",
+            "Pending",
+        ]
+    )
 
-wb.save(out_path)
-print(out_path)
+    worksheet.freeze_panes = "A2"
+    worksheet.print_title_rows = "1:1"
+
+    # Public-safe synthetic metadata.
+    workbook.properties.creator = "Example Portfolio"
+    workbook.properties.lastModifiedBy = "Example Portfolio"
+    workbook.properties.title = "Synthetic Portfolio Workbook"
+    workbook.properties.subject = "Portfolio Example"
+    workbook.properties.description = (
+        "Synthetic workbook for portfolio demonstration"
+    )
+
+    workbook.save(OUTPUT_PATH)
+    print(OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    create_synthetic_workbook()

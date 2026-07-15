@@ -6,4 +6,4 @@
 - Preserve backward compatibility for existing spreadsheet columns and rename marks when possible.
 - Run available checks before proposing changes.
 - Treat data loss, duplicate processing, secret exposure, and silent partial writes as P1 findings.
-- Keep examples synthetic and safe for public display.
+- Use only manually reviewed and anonymized data examples in the public repository.

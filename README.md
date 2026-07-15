@@ -17,6 +17,7 @@ The original process used several Google Sheets, Slack notifications, and a part
 ## Project structure
 
 - [`google-apps-script/aff-partners-info`](google-apps-script/aff-partners-info) — spreadsheet events, notifications, and data synchronization;
+- [`google-apps-script/aff-partners-info/example-data`](google-apps-script/aff-partners-info/example-data) — instructions for adding a manually anonymized workbook example;
 - [`rename_partners`](rename_partners) — API-based partner name updates and follow-up spreadsheet synchronization;
 - [`docs/architecture.md`](docs/architecture.md) — a short overview of the data flow;
 - [`.github/workflows/checks.yml`](.github/workflows/checks.yml) — automated code checks.
@@ -54,7 +55,9 @@ flowchart LR
 
 ## Public version
 
-This repository does not contain production credentials, real spreadsheet identifiers, internal Slack IDs, or company data. The workbook and configuration examples use synthetic values.
+This repository does not contain production credentials, real spreadsheet identifiers, internal Slack IDs, or company data.
+
+Any workbook example added to the repository should be prepared manually from a copy of the original structure and fully anonymized before publication.
 
 Some integrations cannot be executed without access to the original Google Sheets and partner platform.
 

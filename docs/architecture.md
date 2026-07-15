@@ -39,8 +39,10 @@ flowchart LR
 
 ## Project boundaries
 
-The public repository contains anonymized code and synthetic examples.
+The public repository contains anonymized code and configuration examples.
 
-It does not include production credentials, real spreadsheet identifiers, internal Slack IDs, production datasets, or access to the external partner platform.
+A workbook example, when included, should be a manually prepared copy with real values, comments, links, identifiers, and document metadata removed.
+
+The repository does not include production credentials, real spreadsheet identifiers, internal Slack IDs, production datasets, or access to the external partner platform.
 
 The repository demonstrates the automation logic. It is not intended to be deployed as a standalone product without adaptation.

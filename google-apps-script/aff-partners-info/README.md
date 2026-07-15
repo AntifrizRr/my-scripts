@@ -1,21 +1,19 @@
-# Integration Automation Toolkit
+# Google Sheets and Slack Automation
 
-This portfolio repository contains Google Apps Script and Python utilities for partner operations automation, spreadsheet synchronization, and operational notifications.
+This directory contains the Google Apps Script part of the project.
 
-## What the project demonstrates
-- integration with a partner platform API
-- operational spreadsheet workflows in Google Sheets
-- Slack-based approval and notification flows
-- reporting synchronization and audit logging
-- idempotent processing with retry-aware error handling
+It was created for an operational workflow built around Google Sheets, Slack notifications, and reporting synchronization.
 
-## Core workflows
-1. Approval workflow on the operational sheet
-2. Monthly campaign synchronization into the reporting spreadsheet
-3. Partner-base updates into the affiliate reference sheet
-4. Search-partner statistics and period-based counters
+## Main workflows
+
+1. React to status changes in an operational spreadsheet.
+2. Send Slack notifications when defined conditions are met.
+3. Copy approved records to another sheet.
+4. Synchronize reporting and reference data.
+5. Store technical processing information in log sheets.
 
 ## Script Properties
+
 The Apps Script project expects the following properties:
 
 | Property | Required | Purpose | Safe example |
@@ -28,14 +26,16 @@ The Apps Script project expects the following properties:
 | SLACK_ON_APPROVAL_MENTION | Optional | Mention used for approval notifications | <@example> |
 | SLACK_ANALYST_MENTION | Optional | Mention used for analyst notifications | <@analyst> |
 | SLACK_DEFAULT_STATUS_MENTION | Optional | Default mention for status changes | <@ops> |
-| AFF_MANAGER_STATUS_TAGS_JSON | Optional | Mapping of aff manager values to Slack mentions | {"ops":"<@ops>"} |
+| AFF_MANAGER_STATUS_TAGS_JSON | Optional | Mapping of manager values to Slack mentions | {"ops":"<@ops>"} |
 
-## Security approach
-- Keep real secrets and internal identifiers out of the repository.
-- Load configuration through Script Properties rather than hard-coded constants.
-- Use synthetic demo data for public examples.
+## Workbook example
+
+The repository does not generate a demonstration workbook.
+
+A manually anonymized example can be added to [`example-data`](example-data). The example should preserve only the structure needed to understand the workflow and must not contain real company data or identifiers.
 
 ## Local setup
+
 1. Copy the Apps Script configuration example.
 2. Add the required Script Properties in the Apps Script editor.
 3. Keep credentials and production identifiers local and private.

@@ -16,7 +16,7 @@ logs/
 *.csv
 *.xlsx
 *.xlsm
-!google-apps-script/aff-partners-info/anonymized_table.xlsx
+!google-apps-script/aff-partners-info/example-data/*.xlsx
 
 # Python cache
 __pycache__/
